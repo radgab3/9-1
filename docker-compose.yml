@@ -1,0 +1,247 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: vpn_bot_postgres
+    environment:
+      POSTGRES_DB: vpn_bot_db
+      POSTGRES_USER: vpn_user
+      POSTGRES_PASSWORD: your_strong_password_here
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    networks:
+      - vpn_bot_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vpn_user -d vpn_bot_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: vpn_bot_redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    networks:
+      - vpn_bot_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # VPN Bot Application
+  vpn_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vpn_bot_app
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=vpn_user
+      - DB_PASSWORD=your_strong_password_here
+      - DB_NAME=vpn_bot_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./logs:/app/logs
+      - ./static:/app/static
+      - ./configs:/app/configs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - vpn_bot_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Client Bot
+  client_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vpn_client_bot
+    command: python -m bots.client.main
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=vpn_user
+      - DB_PASSWORD=your_strong_password_here
+      - DB_NAME=vpn_bot_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CLIENT_BOT_TOKEN=${CLIENT_BOT_TOKEN}
+    volumes:
+      - ./logs:/app/logs
+      - ./static:/app/static
+    depends_on:
+      - vpn_bot
+    restart: unless-stopped
+    networks:
+      - vpn_bot_network
+
+  # Support Bot
+  support_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vpn_support_bot
+    command: python -m bots.support.main
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=vpn_user
+      - DB_PASSWORD=your_strong_password_here
+      - DB_NAME=vpn_bot_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - SUPPORT_BOT_TOKEN=${SUPPORT_BOT_TOKEN}
+      - SUPPORT_GROUP_ID=${SUPPORT_GROUP_ID}
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - vpn_bot
+    restart: unless-stopped
+    networks:
+      - vpn_bot_network
+
+  # Admin Bot
+  admin_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vpn_admin_bot
+    command: python -m bots.admin.main
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=vpn_user
+      - DB_PASSWORD=your_strong_password_here
+      - DB_NAME=vpn_bot_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ADMIN_BOT_TOKEN=${ADMIN_BOT_TOKEN}
+      - ADMIN_TELEGRAM_IDS=${ADMIN_TELEGRAM_IDS}
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - vpn_bot
+    restart: unless-stopped
+    networks:
+      - vpn_bot_network
+
+  # API Server (для webhook'ов и внешних интеграций)
+  api_server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vpn_api_server
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=vpn_user
+      - DB_PASSWORD=your_strong_password_here
+      - DB_NAME=vpn_bot_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - vpn_bot
+    restart: unless-stopped
+    networks:
+      - vpn_bot_network
+
+  # Nginx (Reverse Proxy)
+  nginx:
+    image: nginx:alpine
+    container_name: vpn_bot_nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+      - ./static:/var/www/static
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - api_server
+    restart: unless-stopped
+    networks:
+      - vpn_bot_network
+
+  # Monitoring (Prometheus)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: vpn_bot_prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    networks:
+      - vpn_bot_network
+
+  # Monitoring (Grafana)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: vpn_bot_grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - vpn_bot_network
+
+  # Log aggregation (Loki)
+  loki:
+    image: grafana/loki:latest
+    container_name: vpn_bot_loki
+    volumes:
+      - loki_data:/loki
+      - ./monitoring/loki.yml:/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    restart: unless-stopped
+    networks:
+      - vpn_bot_network
+
+  #
